@@ -3,6 +3,8 @@
 #include <iostream>
 #include <vector>
 #include <cstdlib>
+#include <unordered_set>
+#include <mutex>
 #include <boost/filesystem.hpp>
 
 #include <bsoncxx/builder/stream/document.hpp>
@@ -63,13 +65,24 @@ void sendStyle(crow::response &res, std::string fileName)
     sendFile(res, fileName, "text/css");
 }
 
-crow::mustache::rendered_template getView(const std::string &filename, crow::mustache::context &x)
+void getView(crow::response &res, const std::string &filename, crow::mustache::context &x)
 {
-    return crow::mustache::load(filename + ".html").render(x);
+    res.set_header("Content-Type", "text/html");
+    auto text = crow::mustache::load(filename + ".html").render_string(x);
+    res.write(text);
+    res.end();
+}
+
+void notFound(crow::response &res, const std::string &message)
+{
+    res.code = crow::status::NOT_FOUND;
+    res.end();
 }
 
 int main(int argc, char *argv[])
 {
+    std::mutex mtx;
+    std::unordered_set<crow::websocket::connection *> users;
     crow::SimpleApp app;
     crow::mustache::set_global_base("../public/");
 
@@ -78,17 +91,122 @@ int main(int argc, char *argv[])
     mongocxx::client conn{mongocxx::uri{mongoConnect}};
     auto collection = conn["cppweb"]["contacts"];
 
+    CROW_ROUTE(app, "/ws")
+        .websocket()
+        .onopen([&](crow::websocket::connection &conn){
+            std::lock_guard<std::mutex> _(mtx);
+            users.insert(&conn);
+        })
+        .onclose([&](crow::websocket::connection &conn, const std::string &reason){
+            std::lock_guard<std::mutex> _(mtx);
+            users.erase(&conn);
+        })
+        .onmessage([&](crow::websocket::connection &/*conn*/, const std::string &data, bool isBinary){
+            std::lock_guard<std::mutex> _(mtx);
+            for(auto &user: users){
+                if(isBinary){
+                    user->send_binary(data);
+                }else{
+                    user->send_text(data);
+                }
+            }
+        });
+
+    CROW_ROUTE(app, "/add/<int>/<int>")
+    ([](const crow::request &req, crow::response &res, const int &a, const int &b)
+     {
+        res.set_header("Content-Type","text/plain");
+
+        std::ostringstream os;
+        os << "Integer: " << a << "+" << b << "=" << a+b << "\n";
+        res.write(os.str());
+        res.end(); });
+
+    CROW_ROUTE(app, "/add/<double>/<double>")
+    ([](const crow::request &req, crow::response &res, const double &a, const double &b)
+     {
+        res.set_header("Content-Type","text/plain");
+
+        std::ostringstream os;
+        os << "Double: " << a << "+" << b << "=" << a+b << "\n";
+        res.write(os.str());
+        res.end(); });
+
+    CROW_ROUTE(app, "/add/<string>/<string>")
+    ([](const crow::request &req, crow::response &res, const std::string &a, const std::string &b)
+     {
+        res.set_header("Content-Type","text/plain");
+
+        std::ostringstream os;
+        os << "String: " << a << "+" << b << "=" << a+b << "\n";
+        res.write(os.str());
+        res.end(); });
+
+    CROW_ROUTE(app, "/query")
+    ([](const crow::request &req, crow::response &res)
+     {
+        auto firstName = req.url_params.get("firstname");
+        auto lastName = req.url_params.get("lastname");
+
+        std::ostringstream os;
+        os << "Hello " << (firstName ? firstName : "") << " " << (lastName ? lastName : "") << "\n";
+
+        res.write(os.str());
+        res.end(); });
+
+    CROW_ROUTE(app, "/api/v1/test").methods(crow::HTTPMethod::POST)([](const crow::request &req, crow::response &res)
+                                                                    {
+        std::string method = method_name(req.method);
+        res.set_header("Content-type","text/plain");
+        res.write(method + " rest_test");
+        res.end(); });
+
+    CROW_ROUTE(app, "/api/v1/contacts")
+    ([&collection](const crow::request &req)
+     {
+        auto skip = req.url_params.get("skip");
+        auto limit = req.url_params.get("limit");
+
+
+        mongocxx::options::find opts;
+        opts.skip(skip ? std::stoi(skip) : 0);
+        opts.limit(limit ? std::stoi(limit) : 10);
+        auto docs = collection.find({}, opts);
+        std::vector<crow::json::rvalue> contacts;
+        contacts.reserve(10);
+
+        for(auto doc : docs){
+            contacts.push_back(crow::json::load(bsoncxx::to_json(doc)));
+        }
+
+        crow::json::wvalue dto;
+        dto["contacts"] = contacts;
+        return crow::response{dto}; });
+
     CROW_ROUTE(app, "/contact/<string>")
-    ([&collection](std::string email)
+    ([&collection](const crow::request &req, crow::response &res, std::string email)
      {
         auto doc = collection.find_one(make_document(kvp("email", email)));
+        if(!doc) return notFound(res, "Contact");
+
         crow::json::wvalue dto;
         dto["contact"] = crow::json::load(bsoncxx::to_json(doc.value().view()));
 
-        return getView("contact", dto); });
+        return getView(res, "contact", dto); });
+
+    CROW_ROUTE(app, "/contact/<string>/<string>")
+    ([&collection](const crow::request &req, crow::response &res, std::string firstName, std::string lastName)
+     {
+        auto doc = collection.find_one(make_document(kvp("firstName", firstName), kvp("lastName", lastName)));
+        if(!doc)  return notFound(res, "Contact");
+
+        crow::json::wvalue dto;
+        dto["contact"] = crow::json::load(bsoncxx::to_json(doc.value().view()));
+
+        return getView(res, "contact", dto); });
 
     CROW_ROUTE(app, "/contacts")
-    ([&collection]()
+    ([&collection](const crow::request &req, crow::response &res)
      {
         mongocxx::options::find opts;
         opts.skip(9);
@@ -105,7 +223,7 @@ int main(int argc, char *argv[])
 
         dto["contacts"] = contacts;
 
-        return getView("contacts", dto); });
+        return getView(res, "contacts", dto); });
 
     CROW_ROUTE(app, "/")
     ([](const crow::request &req, crow::response &res)
